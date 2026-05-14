@@ -6,6 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="29a3256f-bedd-4b48-9a11-0d90240ee151" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/langgraph_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/langgraph_agent.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/mock_db.py" beforeDir="false" afterPath="$PROJECT_DIR$/mock_db.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -13,7 +14,7 @@
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="10" />
+    <option name="cachedIndexableFilesCount" value="8" />
   </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />

@@ -20,7 +20,13 @@ CUSTOMERS = {
         "phone": "9988776655",
         "name": "Aisha Khan",
         "loan_no": "LN-1003"
-    }
+    },
+"C104": {
+        "dob": "1995-04-22",
+        "phone": "7405582440",
+        "name": "Akshay Udnur",
+        "loan_no": "LN-1004"
+    },
 }
 
 LOANS = {
@@ -55,8 +61,18 @@ LOANS = {
         "loan_details": [
             "Prime loan terms with stricter delinquency follow-up.",
             "Concessions available only for verified hardship."
-        ]
-    }
+        ],
+    },
+"LN-1004": {
+        "start_date": "2023-01-01",
+        "loan_document_id": "loan_rules_prime_v1.pdf",
+        "amount_due": 780.0,
+        "due_date": "28-04-2026",
+        "status": "Partially paid",
+        "loan_details": [
+            "Prime loan terms with stricter delinquency follow-up.",
+            "Concessions available only for verified hardship."
+        ]}
 }
 
 CONCESSIONS = {
@@ -79,6 +95,14 @@ CONCESSIONS = {
         "plans": [
             {"plan_id": "PrimeReview", "description": "Route to hardship review before concession approval."},
             {"plan_id": "PrimeRestructure1", "description": "One-month term extension after hardship confirmation."}
+        ]
+    },
+"LN-1004": {
+        "eligibility_options": ["hardship_review_only", "restructure_1_month"],
+        "plans": [
+            {"plan_id": "PrimeReview", "description": "Route to hardship review before concession approval."},
+            {"plan_id": "PrimeRestructure1", "description": "One-month term extension after hardship confirmation."},
+            {"plan_id": "CloseLoan", "description": "Pay 70% of loan amount and close account if he is job less for 1 year"}
         ]
     }
 }
