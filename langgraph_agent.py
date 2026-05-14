@@ -186,6 +186,10 @@ Your goal is to collect overdue payments in a compliant, empathetic, and efficie
 - For loan document questions: use `loan_document_lookup` and `loan_document_context_lookup`.
 - If a requested concession is not available in eligible options/plans, do NOT escalate.
   Continue negotiation by offering closest available alternatives and re-confirm customer preference.
+- If `loan_document_lookup` returns no document for the provided start date, do NOT escalate to human.
+  Ask for confirmation/correction of the loan start date and retry lookup, up to 4 attempts total.
+  If still unavailable after 4 attempts, continue the conversation with available account actions
+  (payment now, promise to pay, hardship/concession flow) without escalation.
 
 ## ESCALATION — ONLY for:
 - Customer uses abusive language.
@@ -198,7 +202,18 @@ Your goal is to collect overdue payments in a compliant, empathetic, and efficie
 - Always wait for tool results before continuing.
 - Be empathetic, professional, concise.
 - Maximum tool usage: each individual tool can be called at most 4 times per conversation.
-- If a tool has already been called 4 times, do not call it again; continue with conversational resolution.
+- If a tool has already been called 4 times and another call is attempted for that tool, escalate to human agent.
+
+## PER-TOOL CALL CAPS (PER CONVERSATION)
+- `customer_verify`: max 4 calls
+- `fetch_dues`: max 4 calls
+- `loan_document_lookup`: max 4 calls
+- `loan_document_context_lookup`: max 4 calls
+- `concession_eligibility`: max 4 calls
+- `concession_plan_fetching`: max 4 calls
+- `payment_pause_tool`: max 4 calls
+- `promise_capture`: max 4 calls
+- `payment_link_create`: max 4 calls
 """
 
 # ── Graph Nodes ───────────────────────────────────────────────────────────────
@@ -209,6 +224,48 @@ def agent_node(state: AgentState) -> AgentState:
     # Inject system prompt if not already present
     if not messages or not isinstance(messages[0], SystemMessage):
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
+
+    # Handle repeated loan-document lookup failures deterministically before LLM call.
+    loan_lookup_attempts = 0
+    last_lookup_failed = False
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and msg.name == "loan_document_lookup":
+            loan_lookup_attempts += 1
+            try:
+                result = json.loads(msg.content)
+                if not result.get("loanDocument"):
+                    last_lookup_failed = True
+                else:
+                    last_lookup_failed = False
+            except Exception:
+                last_lookup_failed = True
+
+    if last_lookup_failed and loan_lookup_attempts < 4:
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "I could not find the loan document with that start date. "
+                        "Please re-check and share the loan start date again in YYYY-MM-DD format."
+                    )
+                )
+            ],
+            "escalated": False,
+        }
+
+    if last_lookup_failed and loan_lookup_attempts >= 4:
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "I still could not locate the loan document after multiple checks. "
+                        "No problem, we can continue with available options now. "
+                        "Would you like to pay now, set a payment date, or discuss assistance options?"
+                    )
+                )
+            ],
+            "escalated": False,
+        }
 
     response = llm.invoke(messages)
 
@@ -229,9 +286,8 @@ def agent_node(state: AgentState) -> AgentState:
         blocked_text = ", ".join(sorted(set(blocked_tool_names)))
         response = AIMessage(
             content=(
-                f"I have enough checks on {blocked_text} for this call. "
-                "Let us continue with the best available option now. "
-                "Would you prefer to pay now, set a payment date, or review available assistance options?"
+                f"I have reached the allowed tool usage limit for {blocked_text}. "
+                "I will now connect you with a human agent. Please hold."
             )
         )
 
@@ -253,6 +309,7 @@ def agent_node(state: AgentState) -> AgentState:
     # Detect escalation in the model's reply
     content = response.content or ""
     if "human agent" in content.lower() or "connect you with" in content.lower():
+        # Escalate on explicit handoff language, including tool-limit exceed conditions.
         updates["escalated"] = True
 
     return updates
