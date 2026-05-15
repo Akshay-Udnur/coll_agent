@@ -30,6 +30,7 @@ class AgentState(TypedDict):
     loan_no:     str                            # resolved after verification
     customer_id: str                            # resolved after verification
     escalated:   bool                           # human escalation requested?
+    conversation_closed: bool                   # call closed by LLM decision
 
 # ── LangChain Tools ───────────────────────────────────────────────────────────
 @tool
@@ -203,6 +204,8 @@ Your goal is to collect overdue payments in a compliant, empathetic, and efficie
 - Be empathetic, professional, concise.
 - Maximum tool usage: each individual tool can be called at most 4 times per conversation.
 - If a tool has already been called 4 times and another call is attempted for that tool, escalate to human agent.
+- If the call is complete and should end, append `<END_CALL>` at the very end of your final response.
+- Use `<END_CALL>` only when the conversation should be closed.
 
 ## PER-TOOL CALL CAPS (PER CONVERSATION)
 - `customer_verify`: max 4 calls
@@ -311,6 +314,10 @@ def agent_node(state: AgentState) -> AgentState:
     if "human agent" in content.lower() or "connect you with" in content.lower():
         # Escalate on explicit handoff language, including tool-limit exceed conditions.
         updates["escalated"] = True
+    if isinstance(content, str) and "<END_CALL>" in content:
+        cleaned = content.replace("<END_CALL>", "").strip()
+        updates["messages"] = [AIMessage(content=cleaned)]
+        updates["conversation_closed"] = True
 
     return updates
 
@@ -376,6 +383,7 @@ def initial_state(case_ref: str, customer_context: dict | None = None) -> AgentS
         "loan_no":     "",
         "customer_id": "",
         "escalated":   False,
+        "conversation_closed": False,
     }
 
 
