@@ -1,17 +1,19 @@
 """
-Personal Loan Collection Agent — LangGraph Implementation
-Uses: LangGraph StateGraph + ChatGroq (Qwen3-32B) + LangChain tools
+Personal Loan Collection Agent - LangGraph Implementation
+Flow adapted from staged intent/plan/react architecture.
 """
-import os
 import json
+import os
 import uuid
+from datetime import datetime
 from typing import Annotated, Literal
-from dotenv import load_dotenv
+import re
 
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
-from langgraph.graph import StateGraph, END, START
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
@@ -21,35 +23,116 @@ import mock_db
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL_NAME   = os.getenv("MODEL_NAME", "qwen/qwen3-32b")
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen/qwen3-32b")
 
-# ── State ─────────────────────────────────────────────────────────────────────
+
 class AgentState(TypedDict):
-    messages:    Annotated[list, add_messages]  # full conversation history
-    verified:    bool                           # has identity been verified?
-    loan_no:     str                            # resolved after verification
-    customer_id: str                            # resolved after verification
-    escalated:   bool                           # human escalation requested?
-    conversation_closed: bool                   # call closed by LLM decision
+    messages: Annotated[list[BaseMessage], add_messages]
+    verified: bool
+    loan_no: str
+    customer_id: str
+    escalated: bool
+    conversation_closed: bool
+    relevance: str
+    pre_plan_action: str
+    execution_path: str
+    post_memory_action: str
+    react_action: str
+    reflection_action: str
+    response_target: str
+    additional_targets: list[str]
+    plan_action: str
+    policy_ok: bool
+    loop_count: int
+    memory_context: str
 
-# ── LangChain Tools ───────────────────────────────────────────────────────────
+
+def _json(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _last_human_text(messages: list[BaseMessage]) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return msg.content or ""
+    return ""
+
+
+def _is_relevant(text: str) -> bool:
+    t = text.lower().strip()
+    if not t:
+        return False
+    keys = [
+        "loan",
+        "payment",
+        "due",
+        "emi",
+        "pay",
+        "concession",
+        "hardship",
+        "human",
+        "agent",
+        "dob",
+        "phone",
+        "verify",
+        "identity",
+        "penalty",
+        "calculate",
+        "calculated",
+        "calculation",
+        "amount",
+        "total",
+        "rs",
+        "rupee",
+        "why",
+        "how",
+        "explain",
+    ]
+    if any(k in t for k in keys):
+        return True
+    # Treat likely verification/payment payloads as relevant.
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", t):
+        return True
+    if re.search(r"\b\d{10}\b", t):
+        return True
+    return False
+
+
+def _extract_yyyymm(date_str: str) -> str:
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(date_str, fmt).strftime("%Y-%m")
+        except Exception:
+            continue
+    return ""
+
+
+def _has_resolution_action(messages: list[BaseMessage]) -> bool:
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and msg.name in {
+            "payment_link_create",
+            "promise_capture",
+            "concession_plan_fetching",
+        }:
+            return True
+    return False
+
+
 @tool
 def customer_verify(customer_id: str, dob: str, phone: str) -> str:
-    """Verify the customer's identity using their Date of Birth (YYYY-MM-DD) and
-    registered Phone number. Returns isverified, customer_id, and loan_no."""
+    """Verify customer identity using customer id, DOB, and registered phone."""
     customer = mock_db.CUSTOMERS.get(customer_id)
     if customer and customer["dob"] == dob and customer["phone"] == phone:
-        return json.dumps({
-            "isverified": True,
-            "customer_id": customer_id,
-            "loan_no": customer["loan_no"]
-        })
+        return json.dumps({"isverified": True, "customer_id": customer_id, "loan_no": customer["loan_no"]})
     return json.dumps({"isverified": False})
 
 
 @tool
 def loan_document_lookup(loanno: str, loan_start_date: str) -> str:
-    """Find the exact loan document for a given loan number and start date (YYYY-MM-DD)."""
+    """Find loan document id for a loan number and loan start date."""
     loan = mock_db.LOANS.get(loanno)
     if loan and loan["start_date"] == loan_start_date:
         return json.dumps({"loanDocument": loan["loan_document_id"]})
@@ -58,7 +141,7 @@ def loan_document_lookup(loanno: str, loan_start_date: str) -> str:
 
 @tool
 def loan_document_context_lookup(loanDocument: str) -> str:
-    """Lookup details from the loan document (RAG simulation)."""
+    """Return contextual loan details for a loan document id."""
     for loan in mock_db.LOANS.values():
         if loan["loan_document_id"] == loanDocument:
             return json.dumps({"context": loan["loan_details"]})
@@ -67,26 +150,41 @@ def loan_document_context_lookup(loanDocument: str) -> str:
 
 @tool
 def fetch_dues(loanno: str) -> str:
-    """Fetch the overdue amount, due date, and payment status for a loan."""
+    """Fetch overdue amount, due date, and status for a loan."""
     loan = mock_db.LOANS.get(loanno)
     if loan:
-        return json.dumps({
-            "amount": loan["amount_due"],
-            "due_date": loan["due_date"],
-            "status": loan["status"]
-        })
+        return json.dumps({"amount": loan["amount_due"], "due_date": loan["due_date"], "status": loan["status"]})
     return json.dumps({"error": "Loan not found"})
 
 
 @tool
-def concession_eligibility(
-    loanno: str,
-    customer_details: str,
-    debt_to_asset_ratio: float = 0.6,
-    monthly_shortfall: float = 5000.0
-) -> str:
-    """Check concession/hardship eligibility for a customer. Use default values for
-    debt_to_asset_ratio (0.6) and monthly_shortfall (5000) if the customer hasn't provided them."""
+def penalty_estimate(loanno: str, proposed_payment_date: str) -> str:
+    """Estimate late penalty for a proposed payment date."""
+    loan = mock_db.LOANS.get(loanno)
+    if not loan:
+        return json.dumps({"error": "Loan not found"})
+    due = None
+    proposed = None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+        if due is None:
+            try:
+                due = datetime.strptime(loan["due_date"], fmt)
+            except Exception:
+                pass
+        if proposed is None:
+            try:
+                proposed = datetime.strptime(proposed_payment_date, fmt)
+            except Exception:
+                pass
+    if due is None or proposed is None:
+        return json.dumps({"error": "Invalid date format", "expected": "YYYY-MM-DD"})
+    days_late = max((proposed - due).days, 0)
+    return json.dumps({"days_late": days_late, "estimated_penalty": round(days_late * 25.0, 2), "currency": "INR"})
+
+
+@tool
+def concession_eligibility(loanno: str, customer_details: str, debt_to_asset_ratio: float = 0.6, monthly_shortfall: float = 5000.0) -> str:
+    """Check concession eligibility options for a loan."""
     concession = mock_db.CONCESSIONS.get(loanno)
     if concession:
         return json.dumps({"concession": concession["eligibility_options"]})
@@ -95,7 +193,7 @@ def concession_eligibility(
 
 @tool
 def concession_plan_fetching(loanno: str, customerID: str) -> str:
-    """Fetch the available concession/restructure plans for the customer."""
+    """Fetch concession/restructure plans for the customer and loan."""
     concession = mock_db.CONCESSIONS.get(loanno)
     if concession:
         return json.dumps({"concession": concession["plans"]})
@@ -104,7 +202,7 @@ def concession_plan_fetching(loanno: str, customerID: str) -> str:
 
 @tool
 def promise_capture(isPTP: bool, due_date: str, amount: float) -> str:
-    """Capture a Promise to Pay (PTP) from the customer."""
+    """Capture a promise-to-pay commitment."""
     if isPTP:
         mock_db.ACTIONS["promises"].append({"due_date": due_date, "amount": amount})
         return json.dumps({"isSuccess": True})
@@ -112,13 +210,8 @@ def promise_capture(isPTP: bool, due_date: str, amount: float) -> str:
 
 
 @tool
-def payment_pause_tool(
-    from_date: str,
-    to_date: str,
-    isVulnerability: bool,
-    isPause: bool
-) -> str:
-    """Request a payment pause for a vulnerable customer."""
+def payment_pause_tool(from_date: str, to_date: str, isVulnerability: bool, isPause: bool) -> str:
+    """Request a payment pause for vulnerable customers."""
     if isPause and isVulnerability:
         mock_db.ACTIONS["payment_pauses"].append({"from": from_date, "to": to_date})
         return json.dumps({"isSuccess": True})
@@ -127,7 +220,7 @@ def payment_pause_tool(
 
 @tool
 def payment_link_create(isPayNow: bool) -> str:
-    """Generate a payment link (60-minute expiry) for the customer to pay now."""
+    """Create a payment link for immediate payment."""
     if isPayNow:
         link = f"https://pay.example.com/{uuid.uuid4().hex[:8]}"
         mock_db.ACTIONS["payment_links"].append(link)
@@ -140,6 +233,7 @@ ALL_TOOLS = [
     loan_document_lookup,
     loan_document_context_lookup,
     fetch_dues,
+    penalty_estimate,
     concession_eligibility,
     concession_plan_fetching,
     promise_capture,
@@ -147,255 +241,286 @@ ALL_TOOLS = [
     payment_link_create,
 ]
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
-llm = ChatGroq(
-    api_key=GROQ_API_KEY,
-    model=MODEL_NAME,
-    temperature=0,
-).bind_tools(ALL_TOOLS)
+llm = ChatGroq(api_key=GROQ_API_KEY, model=MODEL_NAME, temperature=0).bind_tools(ALL_TOOLS)
 
-# ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an AI-powered outbound collections and customer servicing agent for Personal Loans.
 Your goal is to collect overdue payments in a compliant, empathetic, and efficient manner.
 
-## TOOL CALL RULES (CRITICAL — follow exactly):
-- ONLY emit valid, complete JSON when calling tools. NEVER truncate tool arguments mid-way.
-- NEVER add trailing commas or incomplete JSON.
-- If you are unsure of a required argument value, ask the customer a follow-up question instead of calling the tool.
-- Always complete the full JSON structure before emitting a tool call.
+TOOL CALL RULES:
+- Emit valid, complete JSON for tool calls.
+- If a required argument is missing, ask a follow-up question.
 
-## CONVERSATION FLOW (NOT STRICTLY SEQUENTIAL)
-- Run the conversation naturally like a human collections representative.
-- You do NOT need to follow a rigid numbered order.
-- Adapt to what the customer says and ask only the next most relevant question.
+REQUIRED BEHAVIOR:
+- Start each conversation with greeting and identity verification request.
+- Introduce yourself as an AI-capable agent from Indian Bank.
+- Before verification, do not disclose account-specific details.
+- Collect DOB (YYYY-MM-DD) and registered 10-digit phone, then call customer_verify.
+- If only one verification field is provided, ask for the missing field.
+- After verification, call fetch_dues and explain amount, due date, and status.
 
-## REQUIRED BEHAVIOR
-- Always start a new conversation with a natural greeting, confirm account-holder identity,
-  and request Date of Birth (YYYY-MM-DD) plus registered phone number for verification.
-- In the opening line, clearly introduce yourself as an AI-capable agent from Indian Bank.
-- Before verification, do not discuss dues, concessions, plans, or any account-specific detail.
-- Identity verification is mandatory before sharing account-specific details:
-  ask for Date of Birth (YYYY-MM-DD) and registered phone number, then call `customer_verify`.
-- When calling `customer_verify`, always pass the selected `customer_id` from system context.
-- If verification fails, apologise and offer one more attempt.
-- After verification, call `fetch_dues` with loan_no and clearly explain due amount/date/status.
-- For resolution:
-  - Prioritize repayment within the same calendar month as the current due cycle.
-  - If customer can pay within the same month:
-    - Pay now: call `payment_link_create(isPayNow=True)` and share link.
-    - Pay later in same month: collect date + amount and call `promise_capture`.
-  - If customer cannot pay within the same month:
-    - move to hardship/concession flow and evaluate restructuring options first.
-  - Hardship: show empathy, call `concession_eligibility` then `concession_plan_fetching`;
-    call `payment_pause_tool` only when vulnerability criteria are met.
-  - When discussing deferred/out-of-month payment, clearly inform that penalties/late charges
-    may apply as per loan terms, and guide customer toward the best eligible concession plan.
-- For loan document questions: use `loan_document_lookup` and `loan_document_context_lookup`.
-- If a requested concession is not available in eligible options/plans, do NOT escalate.
-  Continue negotiation by offering closest available alternatives and re-confirm customer preference.
-- If `loan_document_lookup` returns no document for the provided start date, do NOT escalate to human.
-  Ask for confirmation/correction of the loan start date and retry lookup, up to 4 attempts total.
-  If still unavailable after 4 attempts, continue the conversation with available account actions
-  (payment now, promise to pay, hardship/concession flow) without escalation.
+RESOLUTION:
+- Prioritize same-month repayment.
+- If same-month payment is not possible, discuss concession flow and mention penalties/late charges.
+- Use concession_eligibility and concession_plan_fetching for hardship flow.
+- If customer confirms "pay now" (or equivalent), call payment_link_create with isPayNow=true immediately and share the link.
 
-## ESCALATION — ONLY for:
-- Customer uses abusive language.
-- Customer explicitly requests a human agent.
-- Say: "I will now connect you with a human agent. Please hold." then stop.
-- DO NOT escalate for any other reason.
+ESCALATION:
+- Only for abuse or explicit human-agent request.
 
-## CRITICAL:
-- NEVER use internal DOB/phone not stated by the customer in the conversation.
-- Always wait for tool results before continuing.
-- Be empathetic, professional, concise.
-- Maximum tool usage: each individual tool can be called at most 4 times per conversation.
-- If a tool has already been called 4 times and another call is attempted for that tool, escalate to human agent.
-- If the call is complete and should end, append `<END_CALL>` at the very end of your final response.
-- Use `<END_CALL>` only when the conversation should be closed.
-
-## PER-TOOL CALL CAPS (PER CONVERSATION)
-- `customer_verify`: max 4 calls
-- `fetch_dues`: max 4 calls
-- `loan_document_lookup`: max 4 calls
-- `loan_document_context_lookup`: max 4 calls
-- `concession_eligibility`: max 4 calls
-- `concession_plan_fetching`: max 4 calls
-- `payment_pause_tool`: max 4 calls
-- `promise_capture`: max 4 calls
-- `payment_link_create`: max 4 calls
+CLOSURE:
+- Append <END_CALL> only when the conversation is complete.
 """
 
-# ── Graph Nodes ───────────────────────────────────────────────────────────────
-def agent_node(state: AgentState) -> AgentState:
-    """Main LLM reasoning node."""
-    messages = state["messages"]
 
-    # Inject system prompt if not already present
+def intent_relevance_gate_node(state: AgentState) -> AgentState:
+    t = _last_human_text(state["messages"])
+    if not t.strip():
+        # Initial turn has no user message yet; continue flow for greeting.
+        return {"relevance": "relevant"}
+    # Once the call is in progress (verified or loan context resolved),
+    # keep follow-up customer questions in-flow unless truly empty.
+    if state.get("verified") or state.get("loan_no"):
+        return {"relevance": "relevant"}
+    return {"relevance": "relevant" if _is_relevant(t) else "irrelevant"}
+
+
+def irrelevant_response_node(state: AgentState) -> AgentState:
+    return {"messages": [AIMessage(content="I can help with your personal loan dues, payment options, or concessions. Please share what you need.")]}
+
+
+def intent_pre_plan_gate_node(state: AgentState) -> AgentState:
+    if not state.get("verified"):
+        return {"pre_plan_action": "decide"}
+    if state.get("loop_count", 0) > 2:
+        return {"pre_plan_action": "plan"}
+    return {"pre_plan_action": "decide"}
+
+
+def plan_proposal_node(state: AgentState) -> AgentState:
+    plan_text = (
+        "Plan: verify identity if pending, then fetch dues, prioritize same-month payment, "
+        "else evaluate concession and penalties, then confirm next commitment."
+    )
+    return {"messages": [AIMessage(content=plan_text)], "plan_action": "continue"}
+
+
+def intent_execution_path_node(state: AgentState) -> AgentState:
+    if state.get("memory_context"):
+        return {"execution_path": "need_tool"}
+    if state.get("verified"):
+        return {"execution_path": "need_tool"}
+    return {"execution_path": "need_memory"}
+
+
+def memory_retrieve_node(state: AgentState) -> AgentState:
+    snippets = []
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, ToolMessage) and msg.name in {"promise_capture", "payment_link_create", "concession_plan_fetching"}:
+            snippets.append(f"{msg.name}:{msg.content}")
+        if len(snippets) >= 3:
+            break
+    memory = " | ".join(snippets) if snippets else "No prior commitments recorded."
+    return {"memory_context": memory}
+
+
+def intent_post_memory_plan_gate_node(state: AgentState) -> AgentState:
+    if "No prior commitments" in state.get("memory_context", ""):
+        return {"post_memory_action": "react"}
+    return {"post_memory_action": "plan"}
+
+
+def react_node(state: AgentState) -> AgentState:
+    messages = state["messages"]
     if not messages or not isinstance(messages[0], SystemMessage):
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
-
-    # Handle repeated loan-document lookup failures deterministically before LLM call.
-    loan_lookup_attempts = 0
-    last_lookup_failed = False
-    for msg in messages:
-        if isinstance(msg, ToolMessage) and msg.name == "loan_document_lookup":
-            loan_lookup_attempts += 1
-            try:
-                result = json.loads(msg.content)
-                if not result.get("loanDocument"):
-                    last_lookup_failed = True
-                else:
-                    last_lookup_failed = False
-            except Exception:
-                last_lookup_failed = True
-
-    if last_lookup_failed and loan_lookup_attempts < 4:
+    try:
+        response = llm.invoke(messages)
+    except Exception:
+        # Keep graph alive on transient provider/network failures.
         return {
             "messages": [
                 AIMessage(
                     content=(
-                        "I could not find the loan document with that start date. "
-                        "Please re-check and share the loan start date again in YYYY-MM-DD format."
+                        "I am unable to reach the model service right now due to a connection issue. "
+                        "Please retry in a few seconds."
                     )
                 )
             ],
-            "escalated": False,
+            "react_action": "respond_end",
         }
-
-    if last_lookup_failed and loan_lookup_attempts >= 4:
-        return {
-            "messages": [
-                AIMessage(
-                    content=(
-                        "I still could not locate the loan document after multiple checks. "
-                        "No problem, we can continue with available options now. "
-                        "Would you like to pay now, set a payment date, or discuss assistance options?"
-                    )
-                )
-            ],
-            "escalated": False,
-        }
-
-    response = llm.invoke(messages)
-
-    # Enforce hard tool-call cap: max 4 calls per tool per conversation.
-    tool_call_counts: dict[str, int] = {}
-    for msg in messages:
-        if isinstance(msg, ToolMessage) and msg.name:
-            tool_call_counts[msg.name] = tool_call_counts.get(msg.name, 0) + 1
-
-    blocked_tool_names: list[str] = []
+    txt = response.content or ""
+    updates: dict = {"messages": [response], "react_action": "respond_end"}
     if hasattr(response, "tool_calls") and response.tool_calls:
-        for tc in response.tool_calls:
-            tname = tc.get("name")
-            if tname and tool_call_counts.get(tname, 0) >= 4:
-                blocked_tool_names.append(tname)
-
-    if blocked_tool_names:
-        blocked_text = ", ".join(sorted(set(blocked_tool_names)))
-        response = AIMessage(
-            content=(
-                f"I have reached the allowed tool usage limit for {blocked_text}. "
-                "I will now connect you with a human agent. Please hold."
-            )
-        )
-
-    # Extract verification info from the latest tool messages if not yet verified
-    updates: dict = {"messages": [response]}
-    if not state.get("verified"):
-        for msg in reversed(messages):
-            if isinstance(msg, ToolMessage) and msg.name == "customer_verify":
-                try:
-                    result = json.loads(msg.content)
-                    if result.get("isverified"):
-                        updates["verified"]    = True
-                        updates["loan_no"]     = result.get("loan_no", "")
-                        updates["customer_id"] = result.get("customer_id", "")
-                except Exception:
-                    pass
-                break
-
-    # Detect escalation in the model's reply
-    content = response.content or ""
-    if "human agent" in content.lower() or "connect you with" in content.lower():
-        # Escalate on explicit handoff language, including tool-limit exceed conditions.
+        updates["react_action"] = "act"
+    if "human agent" in txt.lower():
         updates["escalated"] = True
-    if isinstance(content, str) and "<END_CALL>" in content:
-        cleaned = content.replace("<END_CALL>", "").strip()
+    if "<END_CALL>" in txt:
+        cleaned = txt.replace("<END_CALL>", "").strip()
         updates["messages"] = [AIMessage(content=cleaned)]
-        updates["conversation_closed"] = True
-
+        # Guard closure so greeting/early turns cannot end the conversation.
+        if state.get("verified") and _has_resolution_action(state["messages"]):
+            updates["conversation_closed"] = True
     return updates
 
 
-def human_escalation_node(state: AgentState) -> AgentState:
-    """Terminal node when human escalation is triggered."""
-    return {"escalated": True}
+def collection_reflect_node(state: AgentState) -> AgentState:
+    loop = state.get("loop_count", 0) + 1
+    updates: dict = {"loop_count": loop, "reflection_action": "complete", "policy_ok": True}
+
+    if loop >= 12:
+        # Do not auto-escalate for loop count alone. Keep conversation alive and
+        # push the agent back to a direct action question.
+        updates["reflection_action"] = "retry_react"
+        updates["messages"] = [
+            AIMessage(
+                content=(
+                    "Please confirm your preferred next step: pay now, set a payment date, "
+                    "or explore concession options."
+                )
+            )
+        ]
+        return updates
+
+    # Policy: if out-of-month promise captured, enforce concession path note
+    due_month = ""
+    proposed_date = ""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, ToolMessage) and msg.name == "fetch_dues":
+            due_month = _extract_yyyymm(_json(msg.content).get("due_date", ""))
+            break
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, ToolMessage) and msg.name == "promise_capture":
+            proposed_date = _json(msg.content).get("due_date", "")
+            break
+    if due_month and proposed_date and _extract_yyyymm(proposed_date) != due_month:
+        updates["policy_ok"] = False
+        updates["reflection_action"] = "retry_plan"
+        updates["messages"] = [AIMessage(content="Policy check: out-of-month payment needs concession guidance and penalty disclosure.")]
+        return updates
+
+    if not state.get("conversation_closed"):
+        updates["reflection_action"] = "complete"
+    return updates
 
 
-# ── Routing ───────────────────────────────────────────────────────────────────
-def route_after_agent(state: AgentState) -> Literal["tools", "escalation", "__end__"]:
-    last = state["messages"][-1]
+def relevant_response_node(state: AgentState) -> AgentState:
+    target = "customer"
+    additional = []
+    if state.get("escalated"):
+        target = "human_agent"
+        additional.append("handoff_required")
+    return {"response_target": target, "additional_targets": additional}
+
+
+def tool_execution_node():
+    return ToolNode(ALL_TOOLS)
+
+
+def route_after_relevance(state: AgentState) -> Literal["irrelevant_response", "memory_retrieve"]:
+    if state.get("relevance") in {"irrelevant", "empty"}:
+        return "irrelevant_response"
+    return "memory_retrieve"
+
+
+def route_after_pre_plan(state: AgentState) -> Literal["plan_proposal", "react"]:
+    return "plan_proposal" if state.get("pre_plan_action") == "plan" else "react"
+
+
+def route_after_execution_path(state: AgentState) -> Literal["memory_retrieve", "react"]:
+    return "memory_retrieve" if state.get("execution_path") == "need_memory" else "react"
+
+
+def route_after_post_memory(state: AgentState) -> Literal["plan_proposal", "react"]:
+    return "plan_proposal" if state.get("post_memory_action") == "plan" else "react"
+
+
+def route_after_react(state: AgentState) -> Literal["tool_execution", "reflect", "escalation"]:
     if state.get("escalated"):
         return "escalation"
-    if hasattr(last, "tool_calls") and last.tool_calls:
-        return "tools"
-    return "__end__"
+    if state.get("react_action") == "act":
+        return "tool_execution"
+    return "reflect"
 
 
-# ── Build Graph ───────────────────────────────────────────────────────────────
+def route_after_plan(state: AgentState) -> Literal["tool_execution", "reflect"]:
+    if state.get("plan_action") == "propose":
+        return "tool_execution"
+    return "reflect"
+
+
+def route_after_reflect(state: AgentState) -> Literal["react", "plan_proposal", "relevant_response"]:
+    action = state.get("reflection_action")
+    if action == "retry_react":
+        return "react"
+    if action == "retry_plan":
+        return "plan_proposal"
+    return "relevant_response"
+
+
 def build_graph():
     builder = StateGraph(AgentState)
+    builder.add_node("intent_relevance_gate", intent_relevance_gate_node)
+    builder.add_node("irrelevant_response", irrelevant_response_node)
+    builder.add_node("pre_plan_gate", intent_pre_plan_gate_node)
+    builder.add_node("plan_proposal", plan_proposal_node)
+    builder.add_node("execution_path", intent_execution_path_node)
+    builder.add_node("memory_retrieve", memory_retrieve_node)
+    builder.add_node("post_memory_plan_gate", intent_post_memory_plan_gate_node)
+    builder.add_node("react", react_node)
+    builder.add_node("tool_execution", tool_execution_node())
+    builder.add_node("reflect", collection_reflect_node)
+    builder.add_node("relevant_response", relevant_response_node)
+    builder.add_node("escalation", lambda s: {"escalated": True})
 
-    builder.add_node("agent",      agent_node)
-    builder.add_node("tools",      ToolNode(ALL_TOOLS))
-    builder.add_node("escalation", human_escalation_node)
-
-    builder.add_edge(START,       "agent")
-    builder.add_conditional_edges(
-        "agent",
-        route_after_agent,
-        {"tools": "tools", "escalation": "escalation", "__end__": END}
-    )
-    builder.add_edge("tools", "agent")      # after tools → back to agent
+    builder.add_edge(START, "intent_relevance_gate")
+    builder.add_conditional_edges("intent_relevance_gate", route_after_relevance, {"irrelevant_response": "irrelevant_response", "memory_retrieve": "memory_retrieve"})
+    builder.add_edge("irrelevant_response", END)
+    builder.add_edge("memory_retrieve", "pre_plan_gate")
+    builder.add_conditional_edges("pre_plan_gate", route_after_pre_plan, {"plan_proposal": "plan_proposal", "react": "react"})
+    builder.add_conditional_edges("react", route_after_react, {"tool_execution": "tool_execution", "reflect": "reflect", "escalation": "escalation"})
+    builder.add_edge("tool_execution", "react")
+    builder.add_conditional_edges("plan_proposal", route_after_plan, {"tool_execution": "tool_execution", "reflect": "reflect"})
+    builder.add_conditional_edges("reflect", route_after_reflect, {"react": "react", "plan_proposal": "plan_proposal", "relevant_response": "relevant_response"})
+    builder.add_edge("relevant_response", END)
     builder.add_edge("escalation", END)
-
     return builder.compile()
 
 
 graph = build_graph()
 
 
-# ── Initial state factory ─────────────────────────────────────────────────────
 def initial_state(case_ref: str, customer_context: dict | None = None) -> AgentState:
-    """Create a fresh state for a new outbound call."""
     customer_context = customer_context or {}
     customer_name = customer_context.get("name", "")
     customer_id = customer_context.get("customer_id", "")
     loan_no = customer_context.get("loan_no", "")
-
     system_with_context = (
         SYSTEM_PROMPT
-        + f"\n\n[SYSTEM CONTEXT — NOT FOR DISCLOSURE]: "
-        f"Internal case reference is '{case_ref}'. "
-        f"Customer id is '{customer_id}'. Customer name is '{customer_name}'. "
-        f"Loan number is '{loan_no}'. "
-        f"Use the customer name from this context in your greeting. "
-        f"Do NOT mention internal IDs. Do NOT pre-fill DOB or phone — ask the customer."
+        + f"\n\n[SYSTEM CONTEXT - NOT FOR DISCLOSURE]: case_ref='{case_ref}', customer_id='{customer_id}', customer_name='{customer_name}', loan_no='{loan_no}'."
     )
     return {
-        "messages":    [SystemMessage(content=system_with_context)],
-        "verified":    False,
-        "loan_no":     "",
-        "customer_id": "",
-        "escalated":   False,
+        "messages": [SystemMessage(content=system_with_context)],
+        "verified": False,
+        "loan_no": loan_no,
+        "customer_id": customer_id,
+        "escalated": False,
         "conversation_closed": False,
+        "relevance": "",
+        "pre_plan_action": "decide",
+        "execution_path": "need_tool",
+        "post_memory_action": "react",
+        "react_action": "respond_end",
+        "reflection_action": "complete",
+        "response_target": "customer",
+        "additional_targets": [],
+        "plan_action": "continue",
+        "policy_ok": True,
+        "loop_count": 0,
+        "memory_context": "",
     }
 
 
-# ── Convenience helper ────────────────────────────────────────────────────────
 def get_last_ai_text(state: AgentState) -> str:
-    """Extract the last assistant text message from state."""
     for msg in reversed(state["messages"]):
         if isinstance(msg, AIMessage) and msg.content:
             return msg.content
